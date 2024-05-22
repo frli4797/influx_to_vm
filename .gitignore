@@ -1,0 +1,3 @@
+/.migrator_*
+/migrator.log
+/venv/
