@@ -1,3 +1,4 @@
 /.migrator_*
 /migrator.log
 /venv/
+/.whitelist.txt.swp

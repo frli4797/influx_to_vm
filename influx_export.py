@@ -9,7 +9,6 @@ import os
 import warnings
 from typing import Iterable, Dict, List
 
-
 import pandas as pd
 import requests
 from influxdb_client import InfluxDBClient
@@ -18,19 +17,10 @@ from influxdb_client.client.warnings import MissingPivotFunction
 warnings.simplefilter("ignore", MissingPivotFunction)
 no_errors = 0
 
-
 # Create a custom logger
 logger = logging.getLogger(__name__)
-
-# Create handlers
-c_handler = logging.StreamHandler()
-f_handler = logging.FileHandler('migrator.log')
-c_handler.setLevel(logging.INFO)
-f_handler.setLevel(logging.DEBUG)
-
-# Add handlers to the logger
-logger.addHandler(c_handler)
-logger.addHandler(f_handler)
+logging.basicConfig(filename='migrator.log', encoding='utf-8', level=logging.DEBUG)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s -  %(message)s')
 
 try:
     from dotenv import load_dotenv
@@ -99,7 +89,7 @@ def main(args: Dict[str, str]):
 
     now_datetime = datetime.datetime.now()
     # start_datetime = now_datetime - datetime.timedelta(days=365)
-    start_datetime = datetime.datetime(2024,3,22,16,5,11)
+    start_datetime = datetime.datetime(2024, 3, 22, 16, 5, 11)
 
     current_ep = int(now_datetime.timestamp())
     start_ep = int(start_datetime.timestamp())
@@ -134,23 +124,34 @@ def main(args: Dict[str, str]):
                 for gr in df.groupby(["entity_id", "_field"]):
                     measurements_and_fields.append(gr[0])
 
-            whitelist = []
-            whitelist_path = "whitelist.txt"
-            if os.path.exists(whitelist_path):
-                try:
-                    with open(whitelist_path, 'r') as f:
-                        whitelist = f.read().splitlines()
-                except OSError:
-                    logger.debug("Problem reading whitelist. Skipping")
-
-            m_a_f_set = set(measurements_and_fields)
-            whitelist_set = set(whitelist)
-            intersection = m_a_f_set & whitelist_set
-
-
+            measurements_and_fields = whitelist_measurements(measurements_and_fields)
             migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fields, file, url)
 
     # Closing result file.
+
+
+def whitelist_measurements(measurements_and_fields):
+    whitelist = []
+    intersection = []
+    whitelist_path = "whitelist.txt"
+    if os.path.exists(whitelist_path):
+        try:
+            with open(whitelist_path, 'r') as f:
+                whitelist_rows = f.read().splitlines()
+
+                for row_str in whitelist_rows:
+                    row = row_str.split(' ')
+                    if len(row) > 3:
+                        tup = row[1], row[2]
+                        whitelist.append(tup)
+        except OSError:
+            logger.debug("Problem reading whitelist. Skipping")
+
+        if len(whitelist) > 0:
+            m_a_f_set = set(measurements_and_fields)
+            whitelist_set = set(whitelist)
+            intersection = set.intersection(m_a_f_set, whitelist_set)
+    return intersection
 
 
 def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fields, result_file, victoriametrics_url):
@@ -175,7 +176,8 @@ def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fie
             line = get_influxdb_lines(df)
             no_lines = line.count("\n")
             # "db" is added as an extra tag for the value.
-            logger.info(f"({field_no}/{len(measurements_and_fields)}) Writing {no_lines} lines to VictoriaMetrics db={bucket}")
+            logger.info(
+                f"({field_no}/{len(measurements_and_fields)}) Writing {no_lines} lines to VictoriaMetrics db={bucket}")
 
             requests.post(f"{victoriametrics_url}/write?db={bucket}", data=line)
             result_file.write(f"+ {meas}\t{field}\t{current_ep}\n")
@@ -190,7 +192,6 @@ def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fie
                 exit(500)
         # EO Try/catch
         result_file.flush()
-
 
 
 if __name__ == "__main__":
