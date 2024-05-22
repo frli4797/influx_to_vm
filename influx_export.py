@@ -88,13 +88,14 @@ def main(args: Dict[str, str]):
     query_api = client.query_api()  # use synchronous to see errors
 
     now_datetime = datetime.datetime.now()
-    # start_datetime = now_datetime - datetime.timedelta(days=365)
-    start_datetime = datetime.datetime(2024, 3, 22, 16, 5, 11)
+    start_datetime = now_datetime - datetime.timedelta(days=900)
+    # start_datetime = datetime.datetime(2024, 3, 22, 16, 5, 11)
 
     current_ep = int(now_datetime.timestamp())
     start_ep = int(start_datetime.timestamp())
 
-    step_ep = int(2592000 / 8)  # One month
+    #step_ep = int(2592000 / 1)  # One month
+    step_ep = int(datetime.timedelta(days=100).total_seconds())
     now_datetime_str = now_datetime.strftime("%Y%m%d%H%M%S")
     with open(f".migrator_{now_datetime_str}", 'w') as file:
 
@@ -120,12 +121,20 @@ def main(args: Dict[str, str]):
             # Something like query_data_frame_stream() might be then useful.
 
             measurements_and_fields = []
-            for df in timeseries:
+            if type(timeseries) is pd.DataFrame:
+                df = timeseries
                 for gr in df.groupby(["entity_id", "_field"]):
                     measurements_and_fields.append(gr[0])
+            else:
+                for df in timeseries:
+                    if type(df) is str:
+                        logger.warning(f"DF {df} is a string!!")
+                        continue
+                    for gr in df.groupby(["entity_id", "_field"]):
+                        measurements_and_fields.append(gr[0])
 
-            measurements_and_fields = whitelist_measurements(measurements_and_fields)
-            migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fields, file, url)
+            # measurements_and_fields = whitelist_measurements(measurements_and_fields)
+            migrate_segment("hass", query_api, current_ep, step_ep, measurements_and_fields, file, url)
 
     # Closing result file.
 
@@ -145,7 +154,7 @@ def whitelist_measurements(measurements_and_fields):
                         tup = row[1], row[2]
                         whitelist.append(tup)
         except OSError:
-            logger.debug("Problem reading whitelist. Skipping")
+            logger.warn("Problem reading whitelist. Skipping")
 
         if len(whitelist) > 0:
             m_a_f_set = set(measurements_and_fields)
@@ -172,24 +181,28 @@ def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fie
                     """
             field_no += 1
             df = query_api.query_data_frame(whole_series)
-
+            if df.empty:
+                logger.debug(f"No data points for {meas} {field}")
+                continue
             line = get_influxdb_lines(df)
             no_lines = line.count("\n")
             # "db" is added as an extra tag for the value.
             logger.info(
-                f"({field_no}/{len(measurements_and_fields)}) Writing {no_lines} lines to VictoriaMetrics db={bucket}")
+                f"({field_no}/{len(measurements_and_fields)}) "
+                f"Writing {no_lines} lines to VictoriaMetrics db={bucket}")
 
             requests.post(f"{victoriametrics_url}/write?db={bucket}", data=line)
             result_file.write(f"+ {meas}\t{field}\t{current_ep}\n")
         except Exception as err:
-            logger.error(f"Failed reading or writing {meas} {field}")
+            logger.error(f"Failed reading or writing {meas} {field} with error {err}")
             global no_errors
             no_errors += 1
             result_file.write(f"- {meas}\t{field}\t{current_ep}\n")
             if no_errors > 10:
                 print("Too many errors. Bailing")
                 logger.fatal("Too many errors. Bailing")
-                exit(500)
+                raise err
+                # exit(500)
         # EO Try/catch
         result_file.flush()
 
