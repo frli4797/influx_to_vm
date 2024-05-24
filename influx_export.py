@@ -19,25 +19,35 @@ no_errors = 0
 
 # Create a custom logger
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename='migrator.log', encoding='utf-8', level=logging.DEBUG)
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s -  %(message)s')
+logging.basicConfig(filename='migrator.log', encoding='utf-8', level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s -  %(message)s')
 
 try:
-    from dotenv import load_dotenv
+    import dotenv
 
-    load_dotenv(dotenv_path=".env")
-except ImportError:
+    dotenv.load_dotenv(dotenv_path=".env")
+except ImportError as err:
     pass
 
 
+
 def get_tag_cols(dataframe_keys: Iterable) -> Iterable:
-    """Filter out dataframe keys that are not tags"""
+    """
+    Filter out dataframe keys that are not tags
+
+    @param dataframe_keys:
+    @return:
+    """
     return (
         k
         for k in dataframe_keys
         if not k.startswith("_") and k not in ["result", "table"]
     )
 
+def list_get_influxdb_lines(df_list: list[pd.DataFrame]) -> str:
+    line = ""
+    for df in df_list:
+        line = line + "\n" + get_influxdb_lines(df)
+    return line
 
 def get_influxdb_lines(df: pd.DataFrame) -> str:
     """
@@ -52,6 +62,10 @@ def get_influxdb_lines(df: pd.DataFrame) -> str:
     Protocol description: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/
     """
     logger.info(f"Exporting {df.columns}")
+
+    if df.empty:
+        logger.debug(f"No data points for this")
+        return ""
 
     # line = df["_measurement"]
     line = df["entity_id"]
@@ -88,13 +102,13 @@ def main(args: Dict[str, str]):
     query_api = client.query_api()  # use synchronous to see errors
 
     now_datetime = datetime.datetime.now()
-    start_datetime = now_datetime - datetime.timedelta(days=900)
-    # start_datetime = datetime.datetime(2024, 3, 22, 16, 5, 11)
+    # start_datetime = now_datetime - datetime.timedelta(days=900)
+    start_datetime = datetime.datetime(2021, 1, 9, 1, 1, 0)
 
-    current_ep = int(now_datetime.timestamp())
+    current_ep = int(datetime.datetime(2023, 1, 9, 1, 1, 0).timestamp())
+    # current_ep = int(now_datetime.timestamp())
     start_ep = int(start_datetime.timestamp())
 
-    #step_ep = int(2592000 / 1)  # One month
     step_ep = int(datetime.timedelta(days=100).total_seconds())
     now_datetime_str = now_datetime.strftime("%Y%m%d%H%M%S")
     with open(f".migrator_{now_datetime_str}", 'w') as file:
@@ -112,6 +126,8 @@ def main(args: Dict[str, str]):
             |> first()"""
             timeseries: List[pd.DataFrame] = query_api.query_data_frame(first_in_series)
 
+            # As we're iterating over time spans we might have an empty data set. If that is the case,
+            # let's just continue with the next time span.
             if len(timeseries) < 1:
                 logger.debug("Skipping")
                 continue
@@ -119,29 +135,31 @@ def main(args: Dict[str, str]):
             # get all unique measurement-field pairs and then fetch and export them one-by-one.
             # With really large databases the results should be possibly split further
             # Something like query_data_frame_stream() might be then useful.
-
             measurements_and_fields = []
             if type(timeseries) is pd.DataFrame:
                 df = timeseries
                 for gr in df.groupby(["entity_id", "_field"]):
                     measurements_and_fields.append(gr[0])
+            # It could (for some reason) also be a list of DataFrames.
             else:
                 for df in timeseries:
-                    if type(df) is str:
-                        logger.warning(f"DF {df} is a string!!")
-                        continue
                     for gr in df.groupby(["entity_id", "_field"]):
                         measurements_and_fields.append(gr[0])
 
             # measurements_and_fields = whitelist_measurements(measurements_and_fields)
-            migrate_segment("hass", query_api, current_ep, step_ep, measurements_and_fields, file, url)
+            migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fields, file, url)
 
     # Closing result file.
 
 
-def whitelist_measurements(measurements_and_fields):
-    whitelist = []
-    intersection = []
+def whitelist_measurements(measurements_and_fields: List[tuple]) -> List[tuple]:
+    """
+    Applies a whitelist to the list of measurements and fields. Does nothing if no whitelist is found.
+
+    :param measurements_and_fields :
+    :return:  the new measurements and fields tuple list with the whitelist applied.
+    """
+    whitelist: List[tuple] = []
     whitelist_path = "whitelist.txt"
     if os.path.exists(whitelist_path):
         try:
@@ -151,21 +169,22 @@ def whitelist_measurements(measurements_and_fields):
                 for row_str in whitelist_rows:
                     row = row_str.split(' ')
                     if len(row) > 3:
-                        tup = row[1], row[2]
+                        tup: tuple = row[1], row[2]
                         whitelist.append(tup)
         except OSError:
-            logger.warn("Problem reading whitelist. Skipping")
+            logger.warning("Problem reading whitelist. Skipping")
 
         if len(whitelist) > 0:
             m_a_f_set = set(measurements_and_fields)
             whitelist_set = set(whitelist)
-            intersection = set.intersection(m_a_f_set, whitelist_set)
-    return intersection
+            measurements_and_fields = list(set.intersection(m_a_f_set, whitelist_set))
+
+    return measurements_and_fields
 
 
 def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fields, result_file, victoriametrics_url):
     logger.info(f"Found {len(measurements_and_fields)} unique time series")
-
+    whole_series = ""
     field_no = 1
     for meas, field in measurements_and_fields:
         try:
@@ -181,30 +200,35 @@ def migrate_segment(bucket, query_api, current_ep, step_ep, measurements_and_fie
                     """
             field_no += 1
             df = query_api.query_data_frame(whole_series)
-            if df.empty:
-                logger.debug(f"No data points for {meas} {field}")
-                continue
-            line = get_influxdb_lines(df)
+
+            line: str = ""
+            if type(df) is list:
+                line = list_get_influxdb_lines(df)
+            else:
+                line = get_influxdb_lines(df)
+
             no_lines = line.count("\n")
-            # "db" is added as an extra tag for the value.
             logger.info(
                 f"({field_no}/{len(measurements_and_fields)}) "
                 f"Writing {no_lines} lines to VictoriaMetrics db={bucket}")
 
-            requests.post(f"{victoriametrics_url}/write?db={bucket}", data=line)
-            result_file.write(f"+ {meas}\t{field}\t{current_ep}\n")
+            # "db" is added as an extra tag for the value.
+            requests.post(f"{victoriametrics_url}/write?db=hass", data=line)
+            result_file.write(f"+ {meas} {field} {current_ep}\n")
+            result_file.flush()
+
         except Exception as err:
             logger.error(f"Failed reading or writing {meas} {field} with error {err}")
+            logger.error(f"Query {whole_series}")
             global no_errors
             no_errors += 1
-            result_file.write(f"- {meas}\t{field}\t{current_ep}\n")
+            result_file.write(f"- {meas} {field} {current_ep}\n")
+            result_file.flush()
             if no_errors > 10:
-                print("Too many errors. Bailing")
                 logger.fatal("Too many errors. Bailing")
                 raise err
-                # exit(500)
         # EO Try/catch
-        result_file.flush()
+
 
 
 if __name__ == "__main__":
@@ -266,3 +290,5 @@ if __name__ == "__main__":
         help="VictoriaMetrics server",
     )
     main(vars(parser.parse_args()))
+    print("All done")
+    logger.info("Finished")
